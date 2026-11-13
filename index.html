@@ -1707,13 +1707,13 @@ async function profileFor(user){
   return{uid:user.uid,name,email:user.email,role};
 }
 function setUser(u){
-  currentUser=u;setTimeout(()=>window.renderLive&&renderLive(),0);
+  currentUser=u;setTimeout(()=>window.loadEnr&&loadEnr(),0);
   $('#loginBtn').hidden=true;
   $('#accountBtns').hidden=false;
   $('#dashBtn').innerHTML=`<span class="avatar" style="width:24px;height:24px;font-size:11px;display:inline-grid">${esc((u.name||'?')[0].toUpperCase())}</span> ${esc(cap(u.role))}`;
   $('#dashBtn').onclick=()=>{location.hash=u.role==='admin'?'#admin':'#dashboard'};
 }
-function clearUser(){currentUser=null;setTimeout(()=>window.renderLive&&renderLive(),0);$('#loginBtn').hidden=false;$('#accountBtns').hidden=true}
+function clearUser(){currentUser=null;setTimeout(()=>window.loadEnr&&loadEnr(),0);$('#loginBtn').hidden=false;$('#accountBtns').hidden=true}
 $('#logoutBtn').onclick=async()=>{
   if(auth){try{await auth.signOut()}catch(x){}}
   clearUser();toast('Logged out');
@@ -1746,7 +1746,7 @@ function renderDashboard(){
     const li=(arr,empty)=>arr.length?arr.map(x=>`<li>${esc(x)}</li>`).join(''):`<li style="list-style:none;margin-left:-18px">${empty}</li>`;
     $('#stShort').innerHTML=li([...SHORTLIST.keys()],'Nothing yet. Use Shortlist in List.');
     $('#stShelf').innerHTML=li([...shelf],'Nothing yet. Save an eBook in Library.');
-    $('#stCourses').innerHTML=li(Object.keys(enrolled).map(k=>`${k} (${enrolled[k]}%)`),'Nothing yet. Enrol in Library.');
+    $('#stCourses').innerHTML=li([...Object.keys(enrolled).map(k=>`${k} (${enrolled[k]}%)`),...LIVE.filter(c=>enr[c._id]&&c.status!=='ended').map(c=>'Live: '+c.t)],'Nothing yet. Enrol in Library.');
   }
 }
 $('#teachForm').onsubmit=async e=>{
@@ -2047,6 +2047,26 @@ const saveLive=()=>{try{localStorage.setItem(LIVE_KEY,JSON.stringify(LIVE))}catc
 addEventListener('storage',e=>{if(e.key===LIVE_KEY&&!db){try{LIVE=JSON.parse(e.newValue||'[]')}catch(x){}renderLive()}});
 if(db)db.collection('liveClasses').onSnapshot(s=>{LIVE=s.docs.map(d=>({...d.data(),_id:d.id}));renderLive()},()=>{});
 const isHost=()=>currentUser&&['teacher','admin'].includes(currentUser.role);
+/* Enrolment: kept per account in this browser, and in Firestore users/{uid}.liveEnrolled when Firebase is on */
+let enr={};
+const enrKey=()=>'vh-live-enr-'+(currentUser?(currentUser.email||currentUser.uid):'');
+async function loadEnr(){
+  enr={};
+  if(currentUser){
+    try{(JSON.parse(localStorage.getItem(enrKey())||'[]')).forEach(i=>enr[i]=1)}catch(e){}
+    if(db&&currentUser.uid){try{const d=await db.collection('users').doc(currentUser.uid).get();((d.exists&&d.data().liveEnrolled)||[]).forEach(i=>enr[i]=1)}catch(e){}}
+  }
+  renderLive();
+}
+function enrol(c){
+  enr[c._id]=1;
+  try{localStorage.setItem(enrKey(),JSON.stringify(Object.keys(enr)))}catch(e){}
+  if(db&&currentUser.uid){
+    db.collection('users').doc(currentUser.uid).set({liveEnrolled:firebase.firestore.FieldValue.arrayUnion(c._id)},{merge:true}).catch(()=>{});
+    db.collection('liveClasses').doc(c._id).collection('enrolled').doc(currentUser.uid).set({name:currentUser.name,email:currentUser.email||'',ts:Date.now()}).catch(()=>{});
+  }
+  toast('Enrolled in '+c.t);renderLive();
+}
 function renderLive(){
   const box=$('#liveGrid');if(!box)return;
   $('#liveForm').hidden=!isHost();
@@ -2058,7 +2078,8 @@ function renderLive(){
       <div class="row"><span class="tag">${esc(c.lv)}</span>${live?'<span class="tag" style="background:var(--mint);color:#fff">Live now</span>':''}</div>
       <h3>${esc(c.t)}</h3><p class="meta">${esc(c.by||'')} · ${esc(when)} · ${esc(c.dur)} min</p>${c.desc?`<p class="meta">${esc(c.desc)}</p>`:''}
       <div class="foot">${mine?`<button class="btn small" data-lv="start" data-id="${esc(c._id)}">${live?'Rejoin class':'Start class'}</button><button class="btn small ghost" data-lv="del" data-id="${esc(c._id)}">Cancel</button>`
-        :`<button class="btn small" data-lv="join" data-id="${esc(c._id)}" ${live?'':'disabled'}>${live?'Join now':'Waiting for teacher'}</button>`}</div></article>`}).join('')||'<div class="empty">No live classes scheduled yet.</div>';
+        :enr[c._id]?`<span class="tag" style="background:var(--mint);color:#fff">Enrolled</span><button class="btn small" data-lv="join" data-id="${esc(c._id)}" ${live?'':'disabled'}>${live?'Join now':'Starts '+esc(when)}</button>`
+        :`<button class="btn small" data-lv="enrol" data-id="${esc(c._id)}">Enrol free</button>`}</div></article>`}).join('')||'<div class="empty">No live classes scheduled yet.</div>';
 }
 $('#liveForm').onsubmit=async e=>{
   e.preventDefault();const f=new FormData(e.target),d=new Date(f.get('when'));
@@ -2071,6 +2092,8 @@ $('#liveGrid').onclick=e=>{
   if(!currentUser){toast('Please log in to join live classes');openAuth();return}
   const c=LIVE.find(x=>x._id===b.dataset.id);if(!c)return;
   if(b.dataset.lv==='del'){if(confirm('Cancel this class?'))cmsDeleteItem('liveClasses',c._id);return}
+  if(b.dataset.lv==='enrol'){enrol(c);return}
+  if(b.dataset.lv==='join'&&!enr[c._id]){toast('Enrol in this class first');return}
   openRoom(c,b.dataset.lv==='start');
 };
 
@@ -2116,16 +2139,16 @@ async function openRoom(c,host){
   $('#lvShare').title=host?'Share your screen or a window with everyone':'Share your screen with the teacher';
   $('#lvNotesT').readOnly=!host;
   $('#lvNotesHint').textContent=host?'Students see what you type here, live.':'Notes from your teacher appear here.';
-  $('#lvEmpty').textContent=host?'Your camera is off. Turn it on or share your screen.':"Waiting for the teacher's video…";
   const mk='vh-mn-'+c._id+'-'+(me.email||me.uid);R.mk=mk;
   try{$('#lvMine').value=localStorage.getItem(mk)||''}catch(e){$('#lvMine').value=''}
   $('#lvSaved').textContent='';$('#lvChat').innerHTML='';
   if(host){try{R.notes=localStorage.getItem('vh-cn-'+c._id)||''}catch(e){}$('#lvNotesT').value=R.notes}else $('#lvNotesT').value='';
   R.bus=makeBus(c._id,me,onBus);
-  if(host){
-    R.mic=await getTrack('audio');R.cam=await getTrack('video');
-    R.cur.audio=R.mic;R.cur.video=R.cam;R.bus.send('notes',{text:R.notes});
-  }else sig(c.byId,'join');
+  $('#lvEmpty').textContent=host?'Your camera is off. Turn it on or share your screen.':'Connecting to your teacher…';
+  R.mic=await getTrack('audio');R.cam=await getTrack('video');   /* face and voice on from the start, like Meet */
+  R.cur.audio=R.mic;R.cur.video=R.cam;
+  if(!R){return}
+  if(host)R.bus.send('notes',{text:R.notes});else sig(c.byId,'join');
   refresh();
 }
 function onBus(k,m){

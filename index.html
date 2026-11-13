@@ -2056,7 +2056,12 @@ $('#waForm').onsubmit=e=>{
    Video/audio/screen go peer to peer (WebRTC). With Firebase configured, signalling, chat and class notes
    run through Firestore (liveClasses/{id}/signals, chat, notes). Without Firebase they run over a
    BroadcastChannel, so you can try a full class between two tabs of the same browser. */
-const ICE=[{urls:'stun:stun.l.google.com:19302'}];   /* add a TURN server here for strict school/office networks */
+/* STUN finds the direct route; TURN relays the call when mobile data / school Wi-Fi blocks direct links (the usual cause of "Connecting…" forever).
+   Best: create a free TURN account (metered.ca or Cloudflare) and paste its credentials URL into TURN_API below. */
+const TURN_API='';   /* e.g. 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=YOURKEY' */
+let ICE=[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:global.stun.twilio.com:3478']},
+ {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turns:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}];
+async function loadIce(){if(!TURN_API)return;try{const j=await(await fetch(TURN_API)).json();if(Array.isArray(j)&&j.length)ICE=[ICE[0],...j]}catch(e){console.warn('TURN fetch failed',e)}}
 const LIVE_KEY='vh-live-classes';
 let LIVE=[];try{LIVE=JSON.parse(localStorage.getItem(LIVE_KEY)||'[]')}catch(e){}
 const saveLive=()=>{try{localStorage.setItem(LIVE_KEY,JSON.stringify(LIVE))}catch(e){}};
@@ -2118,18 +2123,20 @@ let seq=0;
 const clean=m=>JSON.parse(JSON.stringify(m));   /* Firestore refuses undefined values */
 function makeBus(cid,me,on){
   if(db){
-    const base=db.collection('liveClasses').doc(cid),pres=base.collection('presence'),un=[],warn=e=>console.warn('live class',e);
+    const base=db.collection('liveClasses').doc(cid),pres=base.collection('presence'),un=[],warn=e=>{console.warn('live class',e);if(!makeBus.w){makeBus.w=1;toast('Live class error: '+(e.code||e.message)+(e.code==='permission-denied'?'. Update the Firestore rules for liveClasses (see firestore-live.rules).':''))}};
     un.push(base.collection('chat').orderBy('ts').onSnapshot(s=>s.docChanges().forEach(c=>c.type==='added'&&on('chat',c.doc.data())),warn));
-    un.push(base.collection('signals').where('to','==',me.uid).onSnapshot(s=>{
+    const sg=base.collection('signals').where('to','==',me.uid);
+    const ready=(async()=>{try{await Promise.all((await sg.get()).docs.map(d=>d.ref.delete().catch(()=>{})))}catch(e){warn(e)}
+    un.push(sg.onSnapshot(s=>{
       s.docChanges().filter(c=>c.type==='added').map(c=>c.doc).sort((a,b)=>a.data().ts-b.data().ts||a.data().n-b.data().n)
-        .forEach(d=>{on('sig',d.data());d.ref.delete().catch(()=>{})})},warn));
+        .forEach(d=>{on('sig',d.data());d.ref.delete().catch(()=>{})})},warn))})();
     un.push(base.collection('notes').doc('shared').onSnapshot(d=>d.exists&&on('notes',d.data()),warn));
     return{
       send(k,m){m=clean(m);
         if(k==='chat')base.collection('chat').add({...m,ts:Date.now()}).catch(warn);
         else if(k==='sig')base.collection('signals').add({...m,ts:Date.now(),n:seq++}).catch(warn);
         else base.collection('notes').doc('shared').set(m).catch(warn)},
-      async announce(cb){await pres.doc(me.uid).set({name:me.name||'',role:me.role||'',ts:Date.now()});const s=await pres.get();s.docs.forEach(d=>d.id!==me.uid&&cb(d.id))},
+      async announce(cb){await ready;await pres.doc(me.uid).set({name:me.name||'',role:me.role||'',ts:Date.now()});const s=await pres.get();s.docs.forEach(d=>d.id!==me.uid&&cb(d.id))},
       close(){un.forEach(f=>f());pres.doc(me.uid).delete().catch(()=>{})}};
   }
   const bc=new BroadcastChannel('vh-live-'+cid);
@@ -2144,7 +2151,7 @@ const sig=(to,type,data)=>R&&R.bus&&R.bus.send('sig',{to,from:R.me.uid,name:R.me
 const st=()=>({mic:!!R.mic,cam:!!R.cam,screen:!!R.screen});
 const isTeacherRole=r=>['teacher','admin'].includes(r);
 async function getTrack(kind){
-  const id=R.dev[kind],c=kind==='audio'?{audio:id?{deviceId:{exact:id}}:true}:{video:id?{deviceId:{exact:id}}:true};
+  const id=R.dev[kind],c=kind==='audio'?{audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,...(id?{deviceId:{exact:id}}:{})}}:{video:{width:{ideal:640},height:{ideal:360},frameRate:{ideal:24},...(id?{deviceId:{exact:id}}:{facingMode:'user'})}};
   try{return(await navigator.mediaDevices.getUserMedia(c)).getTracks()[0]}
   catch(e){toast((kind==='audio'?'Microphone':'Camera')+' is blocked or not found. Allow access in the browser address bar.');return null}
 }
@@ -2154,7 +2161,7 @@ async function openRoom(c,host){
   if(R)return;
   const me=currentUser;
   R={c,host,me,peers:{},cur:{audio:null,video:null,screen:null},mic:null,cam:null,screen:null,dev:{},sink:'',notes:'',spot:null,
-     selfS:new MediaStream(),selfScr:new MediaStream(),t0:Date.now(),sj:{}};
+     selfS:new MediaStream(),selfScr:new MediaStream(),t0:Date.now(),sj:{},early:{}};
   if(host&&c.status!=='live'){const{_id,...rest}=c;await cmsUpdateItem('liveClasses',_id,{...rest,status:'live'})}
   $('#liveRoom').hidden=false;document.body.style.overflow='hidden';
   $('#lvTitle').textContent=c.t;$('#lvEnd').textContent=host?'End class':'Leave';$('#lvMuteAll').hidden=!host;
@@ -2168,10 +2175,12 @@ async function openRoom(c,host){
   R.mic=await getTrack('audio');R.cam=await getTrack('video');   /* face and voice on from the start, like Meet */
   if(!R)return;
   R.cur.audio=R.mic;R.cur.video=R.cam;
+  await loadIce();if(!R)return;
   R.bus=makeBus(c._id,me,onBus);
   if(host)R.bus.send('notes',{text:R.notes});
   try{await R.bus.announce(id=>{R.sj[id]=1;if(id==='*')R.sjAll=1;sig(id,'join',{t:R.t0})})}
   catch(e){console.warn(e);toast('Could not join the class room. Check your Firestore rules.')}
+  R.wd=setInterval(()=>{if(!R||R.host)return;const tp=R.peers[R.c.byId];if(!tp||tp.pc.connectionState==='failed')sig(R.c.byId,'join',{t:R.t0})},6000);
   refresh();
 }
 function onBus(k,m){
@@ -2181,27 +2190,40 @@ function onBus(k,m){
   else if(k==='sig'&&m.from!==R.me.uid&&(m.to===R.me.uid||m.to==='*'))sigIn(m);
 }
 function mkPeer(id,m){
-  const pc=new RTCPeerConnection({iceServers:ICE}),
-    p={pc,name:m.name||'Guest',role:m.role||'',q:[],tr:{},cs:new MediaStream(),ss:new MediaStream(),st:{mic:true,cam:true,screen:false}};
-  R.peers[id]=p;
+  const pc=new RTCPeerConnection({iceServers:ICE,iceCandidatePoolSize:4}),
+    p={pc,name:m.name||'Guest',role:m.role||'',q:[],tr:{},cs:new MediaStream(),ss:new MediaStream(),st:{mic:true,cam:true,screen:false},t:Date.now(),au:new Audio(),rs:0,off:false};
+  R.peers[id]=p;p.au.autoplay=true;p.au.srcObject=p.cs;if(R.sink&&p.au.setSinkId)p.au.setSinkId(R.sink).catch(()=>{});
+  (R.early[id]||[]).splice(0).forEach(c=>p.q.push(c));
   pc.onicecandidate=e=>{if(e.candidate&&R&&R.peers[id]===p)sig(id,'ice',e.candidate.toJSON())};
-  pc.ontrack=e=>{const i=pc.getTransceivers().indexOf(e.transceiver);(i===2?p.ss:p.cs).addTrack(e.track);e.track.onunmute=refresh;refresh()};
+  pc.ontrack=e=>{const i=pc.getTransceivers().indexOf(e.transceiver);(i===2?p.ss:p.cs).addTrack(e.track);e.track.onunmute=refresh;p.au.play().catch(()=>{});refresh()};
   pc.onconnectionstatechange=()=>{
     if(!R||R.peers[id]!==p)return;
-    if(pc.connectionState==='failed')dropPeer(id);
-    else{if(pc.connectionState==='connected')sig(id,'state',st());refresh()}
+    const cs=pc.connectionState;
+    if(cs==='failed')recover(id,p);
+    else if(cs==='disconnected')setTimeout(()=>R&&R.peers[id]===p&&p.pc.connectionState!=='connected'&&recover(id,p),4000);
+    if(cs==='connected'){p.rs=0;sig(id,'state',st())}
+    refresh();
   };
   return p;
 }
+async function recover(id,p){
+  try{
+    if(p.off&&p.rs++<3){p.pc.restartIce();await p.pc.setLocalDescription(await p.pc.createOffer({iceRestart:true}));sig(id,'offer',{...sd(p.pc.localDescription),re:1})}
+    else if(!p.off)setTimeout(()=>R&&R.peers[id]===p&&p.pc.connectionState!=='connected'&&dropPeer(id),6000);
+    else dropPeer(id);
+  }catch(e){dropPeer(id)}
+}
+document.addEventListener('click',()=>R&&Object.values(R.peers).forEach(p=>p.au.play().catch(()=>{})));
 const flush=p=>p.q.splice(0).forEach(c=>p.pc.addIceCandidate(c).catch(()=>{}));
 async function sigIn(m){
   const p=R.peers[m.from];
   try{
     if(m.type==='join'){
       const t=(m.data&&m.data.t)||0;
+      if(p&&Date.now()-p.t<8000&&['new','connecting','connected'].includes(p.pc.connectionState))return;   /* ignore duplicate joins */
       if(R.t0<t||(R.t0===t&&R.me.uid<m.from)){            /* the person who was here first sends the offer */
         if(p)dropPeer(m.from,'silent');
-        const n=mkPeer(m.from,m);
+        const n=mkPeer(m.from,m);n.off=true;
         n.tr={audio:n.pc.addTransceiver(R.cur.audio||'audio',{direction:'sendrecv'}),
               video:n.pc.addTransceiver(R.cur.video||'video',{direction:'sendrecv'}),
               screen:n.pc.addTransceiver(R.cur.screen||'video',{direction:'sendrecv'})};
@@ -2210,6 +2232,7 @@ async function sigIn(m){
         if(R.host)R.bus.send('notes',{text:R.notes});
       }else if(!R.sj[m.from]&&!R.sjAll){R.sj[m.from]=1;sig(m.from,'join',{t:R.t0})}
     }else if(m.type==='offer'){
+      if(p&&m.data&&m.data.re&&!p.off){await p.pc.setRemoteDescription(m.data);await p.pc.setLocalDescription(await p.pc.createAnswer());sig(m.from,'answer',sd(p.pc.localDescription));flush(p);return}
       if(p)dropPeer(m.from,'silent');
       const n=mkPeer(m.from,m);
       await n.pc.setRemoteDescription(m.data);
@@ -2218,7 +2241,7 @@ async function sigIn(m){
       await n.pc.setLocalDescription(await n.pc.createAnswer());
       sig(m.from,'answer',sd(n.pc.localDescription));flush(n);
     }else if(m.type==='answer'&&p){await p.pc.setRemoteDescription(m.data);flush(p)}
-    else if(m.type==='ice'&&p){p.pc.remoteDescription?p.pc.addIceCandidate(m.data).catch(()=>{}):p.q.push(m.data)}
+    else if(m.type==='ice'){if(!p)(R.early[m.from]=R.early[m.from]||[]).push(m.data);else p.pc.remoteDescription?p.pc.addIceCandidate(m.data).catch(()=>{}):p.q.push(m.data)}
     else if(m.type==='state'&&p){p.st=m.data||p.st;refresh()}
     else if(m.type==='mute'){
       if(m.from===R.c.byId&&R.mic){R.mic.stop();R.mic=null;setOut('audio',null);toast('Your teacher muted your microphone. Click Mic to speak again.');refresh()}
@@ -2230,7 +2253,7 @@ async function sigIn(m){
 }
 function dropPeer(id,mode){
   const p=R&&R.peers[id];if(!p)return;
-  delete R.peers[id];delete R.sj[id];try{p.pc.close()}catch(e){}
+  delete R.peers[id];delete R.sj[id];try{p.pc.close()}catch(e){}p.au.srcObject=null;
   const t=$$('#lvTiles .lv-tile').find(x=>x.dataset.id===id);t&&t.remove();
   if(R.spot===id)R.spot=null;
   if(mode==='bye')toast(p.name+' left the class');
@@ -2281,7 +2304,7 @@ function refresh(){
   const M=mainSrc();
   [['me',{name:R.me.name,role:R.me.role,st:st(),cs:R.selfS}],...Object.entries(R.peers)].forEach(([id,o])=>{
     const t=tile(id),v=t.firstChild,mic=o.st.mic!==false;
-    v.muted=id==='me';bind(v,o.cs);
+    v.muted=true;bind(v,o.cs);
     t.hidden=!M.scr&&M.id===id;
     t.classList.toggle('off',o.st.cam===false);t.classList.toggle('on',R.spot===id);
     t.querySelector('em').textContent=(o.name||'?').trim().charAt(0).toUpperCase();
@@ -2319,7 +2342,7 @@ function leave(notify,end){
   if(notify)Object.keys(r.peers).forEach(id=>sig(id,'bye',end?{end:true}:null));
   Object.keys(r.peers).forEach(id=>dropPeer(id,'silent'));
   [r.mic,r.cam,r.screen].forEach(t=>t&&t.stop());
-  if(r.bus)r.bus.close();
+  clearInterval(r.wd);if(r.bus)r.bus.close();
   R=null;
   $('#liveRoom').hidden=true;$('#lvDevs').hidden=true;document.body.style.overflow='';
   $('#lvTiles').innerHTML='';$('#lvMain').srcObject=null;
@@ -2338,7 +2361,7 @@ async function swap(kind,id){
 }
 $('#lvSelMic').onchange=e=>swap('audio',e.target.value);
 $('#lvSelCam').onchange=e=>swap('video',e.target.value);
-$('#lvSelSpk').onchange=e=>{R.sink=e.target.value;$$('#liveRoom video').forEach(v=>v.setSinkId&&v.setSinkId(R.sink).catch(()=>{}))};
+$('#lvSelSpk').onchange=e=>{R.sink=e.target.value;$$('#liveRoom video').forEach(v=>v.setSinkId&&v.setSinkId(R.sink).catch(()=>{}));Object.values(R.peers).forEach(p=>p.au.setSinkId&&p.au.setSinkId(R.sink).catch(()=>{}))};
 /* side panel: chat, class notes, my notes */
 $('#lvTabs').onclick=e=>{
   const b=e.target.closest('button');if(!b)return;

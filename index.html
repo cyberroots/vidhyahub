@@ -544,6 +544,18 @@ footer h4{font-weight:600;letter-spacing:.01em}
 .lv-msg b{display:block;font-size:12px;color:var(--muted)}
 .lv-row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}
 @media (max-width:860px){.lv{grid-template-columns:1fr;grid-template-rows:minmax(0,1fr) 42vh}.lv-side{border-left:0;border-top:1px solid var(--line)}.lv-btn span{display:none}.lv-tile{width:104px}}
+
+.lv-body{flex:1;min-height:0;display:flex;gap:10px}
+.lv-body .lv-stage{flex:1;min-width:0}
+.lv-tiles{flex-direction:column;width:176px;overflow-y:auto;overflow-x:hidden}
+.lv-tile{width:100%;cursor:pointer}
+.lv-tile[hidden],.lv-btn[hidden]{display:none}
+.lv-tile.off video{visibility:hidden}
+.lv-ini{display:none;position:absolute;inset:0;place-items:center;font-style:normal;font-size:34px;font-weight:800;color:#fff}
+.lv-tile.off .lv-ini{display:grid}
+.lv-mb{position:absolute;left:6px;top:6px;background:var(--coral);color:#fff;border-radius:99px;font-size:11px;font-weight:700;padding:2px 8px;text-decoration:none}
+.lv-mic{position:absolute;right:6px;top:6px;border:0;border-radius:99px;background:rgba(0,0,0,.65);color:#fff;font-size:12px;font-weight:700;padding:3px 10px}
+@media (max-width:860px){.lv-body{flex-direction:column}.lv-tiles{flex-direction:row;width:auto;overflow-x:auto;overflow-y:hidden}.lv-tile{width:104px}}
 </style>
 </head>
 <body>
@@ -1052,12 +1064,13 @@ footer h4{font-weight:600;letter-spacing:.01em}
 <div class="lv" id="liveRoom" role="dialog" aria-label="Live class" hidden>
   <div class="lv-main">
     <div class="lv-top"><b id="lvTitle" style="font-family:var(--display);font-size:20px"></b><span class="meta" id="lvInfo"></span></div>
-    <div class="lv-stage"><video id="lvMain" autoplay playsinline></video><div class="lv-empty" id="lvEmpty">Waiting for the teacher's video…</div></div>
-    <div class="lv-tiles" id="lvTiles"></div>
+    <div class="lv-body"><div class="lv-stage"><video id="lvMain" autoplay playsinline></video><div class="lv-empty" id="lvEmpty">Connecting to your teacher…</div></div>
+    <div class="lv-tiles" id="lvTiles"></div></div>
     <div class="lv-bar">
       <button class="lv-btn tog" id="lvMic" aria-pressed="false"><svg class="icon"><use href="#i-mic"/></svg><span>Mic</span></button>
       <button class="lv-btn tog" id="lvCam" aria-pressed="false"><svg class="icon"><use href="#i-video"/></svg><span>Camera</span></button>
       <button class="lv-btn share" id="lvShare" aria-pressed="false"><svg class="icon"><use href="#i-screen"/></svg><span>Share screen</span></button>
+      <button class="lv-btn" id="lvMuteAll" hidden><svg class="icon"><use href="#i-mic"/></svg><span>Mute all</span></button>
       <button class="lv-btn" id="lvDevBtn"><svg class="icon"><use href="#i-gear"/></svg><span>Devices</span></button>
       <button class="lv-btn end" id="lvEnd">Leave</button>
     </div>
@@ -2102,28 +2115,34 @@ $('#liveGrid').onclick=e=>{
 
 /* ---- message bus: Firestore when available, otherwise BroadcastChannel ---- */
 let seq=0;
+const clean=m=>JSON.parse(JSON.stringify(m));   /* Firestore refuses undefined values */
 function makeBus(cid,me,on){
   if(db){
-    const base=db.collection('liveClasses').doc(cid),un=[];
-    un.push(base.collection('chat').orderBy('ts').onSnapshot(s=>s.docChanges().forEach(c=>c.type==='added'&&on('chat',c.doc.data()))));
+    const base=db.collection('liveClasses').doc(cid),pres=base.collection('presence'),un=[],warn=e=>console.warn('live class',e);
+    un.push(base.collection('chat').orderBy('ts').onSnapshot(s=>s.docChanges().forEach(c=>c.type==='added'&&on('chat',c.doc.data())),warn));
     un.push(base.collection('signals').where('to','==',me.uid).onSnapshot(s=>{
       s.docChanges().filter(c=>c.type==='added').map(c=>c.doc).sort((a,b)=>a.data().ts-b.data().ts||a.data().n-b.data().n)
-        .forEach(d=>{on('sig',d.data());d.ref.delete().catch(()=>{})})}));
-    un.push(base.collection('notes').doc('shared').onSnapshot(d=>d.exists&&on('notes',d.data())));
-    return{send(k,m){
-      if(k==='chat')base.collection('chat').add({...m,ts:Date.now()});
-      else if(k==='sig')base.collection('signals').add({...m,ts:Date.now(),n:seq++});
-      else base.collection('notes').doc('shared').set(m)},close(){un.forEach(f=>f())}};
+        .forEach(d=>{on('sig',d.data());d.ref.delete().catch(()=>{})})},warn));
+    un.push(base.collection('notes').doc('shared').onSnapshot(d=>d.exists&&on('notes',d.data()),warn));
+    return{
+      send(k,m){m=clean(m);
+        if(k==='chat')base.collection('chat').add({...m,ts:Date.now()}).catch(warn);
+        else if(k==='sig')base.collection('signals').add({...m,ts:Date.now(),n:seq++}).catch(warn);
+        else base.collection('notes').doc('shared').set(m).catch(warn)},
+      async announce(cb){await pres.doc(me.uid).set({name:me.name||'',role:me.role||'',ts:Date.now()});const s=await pres.get();s.docs.forEach(d=>d.id!==me.uid&&cb(d.id))},
+      close(){un.forEach(f=>f());pres.doc(me.uid).delete().catch(()=>{})}};
   }
   const bc=new BroadcastChannel('vh-live-'+cid);
   bc.onmessage=e=>on(e.data.k,e.data.m);
-  return{send(k,m){bc.postMessage({k,m});if(k==='chat')on('chat',m)},close(){bc.close()}};
+  return{send(k,m){m=clean(m);bc.postMessage({k,m});if(k==='chat')on('chat',m)},announce(cb){cb('*')},close(){bc.close()}};
 }
 
-/* ---- room ---- */
+/* ---- room: every person connects to every other person (mesh), each link carries mic, camera and screen ---- */
 let R=null;
 const sd=d=>({type:d.type,sdp:d.sdp});
-const sig=(to,type,data)=>R.bus.send('sig',{to,from:R.me.uid,name:R.me.name,type,data});
+const sig=(to,type,data)=>R&&R.bus&&R.bus.send('sig',{to,from:R.me.uid,name:R.me.name||'',role:R.me.role||'',type,data:data===undefined?null:data});
+const st=()=>({mic:!!R.mic,cam:!!R.cam,screen:!!R.screen});
+const isTeacherRole=r=>['teacher','admin'].includes(r);
 async function getTrack(kind){
   const id=R.dev[kind],c=kind==='audio'?{audio:id?{deviceId:{exact:id}}:true}:{video:id?{deviceId:{exact:id}}:true};
   try{return(await navigator.mediaDevices.getUserMedia(c)).getTracks()[0]}
@@ -2134,129 +2153,174 @@ async function openRoom(c,host){
   if(!isSecureContext){toast('Live classes need the site to be opened over https (or localhost).');return}
   if(R)return;
   const me=currentUser;
-  R={c,host,me,peers:{},cur:{audio:null,video:null},mic:null,cam:null,screen:null,dev:{},sink:'',notes:'',spot:null,selfS:new MediaStream()};
+  R={c,host,me,peers:{},cur:{audio:null,video:null,screen:null},mic:null,cam:null,screen:null,dev:{},sink:'',notes:'',spot:null,
+     selfS:new MediaStream(),selfScr:new MediaStream(),t0:Date.now(),sj:{}};
   if(host&&c.status!=='live'){const{_id,...rest}=c;await cmsUpdateItem('liveClasses',_id,{...rest,status:'live'})}
   $('#liveRoom').hidden=false;document.body.style.overflow='hidden';
-  $('#lvTitle').textContent=c.t;
-  $('#lvEnd').textContent=host?'End class':'Leave';
-  $('#lvShare').title=host?'Share your screen or a window with everyone':'Share your screen with the teacher';
+  $('#lvTitle').textContent=c.t;$('#lvEnd').textContent=host?'End class':'Leave';$('#lvMuteAll').hidden=!host;
   $('#lvNotesT').readOnly=!host;
   $('#lvNotesHint').textContent=host?'Students see what you type here, live.':'Notes from your teacher appear here.';
-  const mk='vh-mn-'+c._id+'-'+(me.email||me.uid);R.mk=mk;
-  try{$('#lvMine').value=localStorage.getItem(mk)||''}catch(e){$('#lvMine').value=''}
+  R.mk='vh-mn-'+c._id+'-'+(me.email||me.uid);
+  try{$('#lvMine').value=localStorage.getItem(R.mk)||''}catch(e){$('#lvMine').value=''}
   $('#lvSaved').textContent='';$('#lvChat').innerHTML='';
   if(host){try{R.notes=localStorage.getItem('vh-cn-'+c._id)||''}catch(e){}$('#lvNotesT').value=R.notes}else $('#lvNotesT').value='';
-  R.bus=makeBus(c._id,me,onBus);
-  $('#lvEmpty').textContent=host?'Your camera is off. Turn it on or share your screen.':'Connecting to your teacher…';
+  refresh();
   R.mic=await getTrack('audio');R.cam=await getTrack('video');   /* face and voice on from the start, like Meet */
+  if(!R)return;
   R.cur.audio=R.mic;R.cur.video=R.cam;
-  if(!R){return}
-  if(host)R.bus.send('notes',{text:R.notes});else sig(c.byId,'join');
+  R.bus=makeBus(c._id,me,onBus);
+  if(host)R.bus.send('notes',{text:R.notes});
+  try{await R.bus.announce(id=>{R.sj[id]=1;if(id==='*')R.sjAll=1;sig(id,'join',{t:R.t0})})}
+  catch(e){console.warn(e);toast('Could not join the class room. Check your Firestore rules.')}
   refresh();
 }
 function onBus(k,m){
   if(!R)return;
   if(k==='chat')addChat(m);
   else if(k==='notes'){if(!R.host){R.notes=m.text||'';$('#lvNotesT').value=R.notes}}
-  else if(k==='sig'&&m.to===R.me.uid)sigIn(m);
+  else if(k==='sig'&&m.from!==R.me.uid&&(m.to===R.me.uid||m.to==='*'))sigIn(m);
 }
-function mkPeer(id,name){
-  const pc=new RTCPeerConnection({iceServers:ICE}),p={pc,name,q:[],tr:{},rs:new MediaStream()};
+function mkPeer(id,m){
+  const pc=new RTCPeerConnection({iceServers:ICE}),
+    p={pc,name:m.name||'Guest',role:m.role||'',q:[],tr:{},cs:new MediaStream(),ss:new MediaStream(),st:{mic:true,cam:true,screen:false}};
   R.peers[id]=p;
-  pc.onicecandidate=e=>e.candidate&&R&&sig(id,'ice',e.candidate.toJSON());
-  pc.ontrack=e=>{p.rs.addTrack(e.track);e.track.onunmute=refresh;refresh()};
-  pc.onconnectionstatechange=()=>{if(['failed','closed'].includes(pc.connectionState))dropPeer(id);else refresh()};
+  pc.onicecandidate=e=>{if(e.candidate&&R&&R.peers[id]===p)sig(id,'ice',e.candidate.toJSON())};
+  pc.ontrack=e=>{const i=pc.getTransceivers().indexOf(e.transceiver);(i===2?p.ss:p.cs).addTrack(e.track);e.track.onunmute=refresh;refresh()};
+  pc.onconnectionstatechange=()=>{
+    if(!R||R.peers[id]!==p)return;
+    if(pc.connectionState==='failed')dropPeer(id);
+    else{if(pc.connectionState==='connected')sig(id,'state',st());refresh()}
+  };
   return p;
 }
 const flush=p=>p.q.splice(0).forEach(c=>p.pc.addIceCandidate(c).catch(()=>{}));
 async function sigIn(m){
   const p=R.peers[m.from];
   try{
-    if(m.type==='join'&&R.host){
-      if(p)dropPeer(m.from,true);
-      const n=mkPeer(m.from,m.name);
-      n.tr.audio=n.pc.addTransceiver(R.cur.audio||'audio',{direction:'sendrecv'});
-      n.tr.video=n.pc.addTransceiver(R.cur.video||'video',{direction:'sendrecv'});
-      await n.pc.setLocalDescription(await n.pc.createOffer());
-      sig(m.from,'offer',sd(n.pc.localDescription));
-      R.bus.send('notes',{text:R.notes});
-    }else if(m.type==='offer'&&!R.host){
-      if(p)dropPeer(m.from,true);
-      const n=mkPeer(m.from,m.name||'Teacher');
+    if(m.type==='join'){
+      const t=(m.data&&m.data.t)||0;
+      if(R.t0<t||(R.t0===t&&R.me.uid<m.from)){            /* the person who was here first sends the offer */
+        if(p)dropPeer(m.from,'silent');
+        const n=mkPeer(m.from,m);
+        n.tr={audio:n.pc.addTransceiver(R.cur.audio||'audio',{direction:'sendrecv'}),
+              video:n.pc.addTransceiver(R.cur.video||'video',{direction:'sendrecv'}),
+              screen:n.pc.addTransceiver(R.cur.screen||'video',{direction:'sendrecv'})};
+        await n.pc.setLocalDescription(await n.pc.createOffer());
+        sig(m.from,'offer',sd(n.pc.localDescription));
+        if(R.host)R.bus.send('notes',{text:R.notes});
+      }else if(!R.sj[m.from]&&!R.sjAll){R.sj[m.from]=1;sig(m.from,'join',{t:R.t0})}
+    }else if(m.type==='offer'){
+      if(p)dropPeer(m.from,'silent');
+      const n=mkPeer(m.from,m);
       await n.pc.setRemoteDescription(m.data);
-      n.pc.getTransceivers().forEach(t=>{const k=t.receiver.track.kind;t.direction='sendrecv';t.sender.replaceTrack(R.cur[k]||null);n.tr[k]=t});
+      const ts=n.pc.getTransceivers();n.tr={audio:ts[0],video:ts[1],screen:ts[2]};
+      Object.entries(n.tr).forEach(([k,t])=>{t.direction='sendrecv';t.sender.replaceTrack(R.cur[k]||null)});
       await n.pc.setLocalDescription(await n.pc.createAnswer());
       sig(m.from,'answer',sd(n.pc.localDescription));flush(n);
     }else if(m.type==='answer'&&p){await p.pc.setRemoteDescription(m.data);flush(p)}
     else if(m.type==='ice'&&p){p.pc.remoteDescription?p.pc.addIceCandidate(m.data).catch(()=>{}):p.q.push(m.data)}
-    else if(m.type==='bye'){if(R.host)dropPeer(m.from);else{toast('The class has ended.');leave(false)}}
+    else if(m.type==='state'&&p){p.st=m.data||p.st;refresh()}
+    else if(m.type==='mute'){
+      if(m.from===R.c.byId&&R.mic){R.mic.stop();R.mic=null;setOut('audio',null);toast('Your teacher muted your microphone. Click Mic to speak again.');refresh()}
+    }else if(m.type==='bye'){
+      dropPeer(m.from,'bye');
+      if(!R.host&&m.from===R.c.byId&&m.data&&m.data.end){toast('The class has ended.');leave(false)}
+    }
   }catch(err){console.warn('live signal',err)}
 }
-function dropPeer(id,silent){
+function dropPeer(id,mode){
   const p=R&&R.peers[id];if(!p)return;
-  delete R.peers[id];try{p.pc.close()}catch(e){}
+  delete R.peers[id];delete R.sj[id];try{p.pc.close()}catch(e){}
   const t=$$('#lvTiles .lv-tile').find(x=>x.dataset.id===id);t&&t.remove();
   if(R.spot===id)R.spot=null;
-  if(!silent){
-    if(R.host)toast(p.name+' left the class');
-    else{toast('Connection lost. Reconnecting…');setTimeout(()=>R&&!R.peers[id]&&sig(id,'join'),3000)}
-  }
+  if(mode==='bye')toast(p.name+' left the class');
+  else if(!mode){toast(p.name+' lost connection. Reconnecting…');setTimeout(()=>R&&!R.peers[id]&&sig(id,'join',{t:R.t0}),3000)}
   refresh();
 }
-function setOut(kind,t){R.cur[kind]=t;Object.values(R.peers).forEach(p=>p.tr[kind]&&p.tr[kind].sender.replaceTrack(t))}
+function setOut(kind,t){
+  R.cur[kind]=t;
+  Object.values(R.peers).forEach(p=>p.tr[kind]&&p.tr[kind].sender.replaceTrack(t).catch(()=>{}));
+  Object.keys(R.peers).forEach(id=>sig(id,'state',st()));
+}
 async function toggle(kind){
   const k=kind==='audio'?'mic':'cam';
-  if(R[k]){R[k].stop();R[k]=null}else{R[k]=await getTrack(kind);if(!R[k])return}
-  if(kind==='audio'||!R.screen)setOut(kind,R[k]);
-  refresh();
+  if(R[k]){R[k].stop();R[k]=null}else{R[k]=await getTrack(kind);if(!R||!R[k])return}
+  setOut(kind,R[k]);refresh();
 }
 async function share(){
   if(R.screen)return stopShare();
   if(!navigator.mediaDevices.getDisplayMedia){toast('Screen sharing is not available on this device. Use a laptop or desktop browser.');return}
-  try{const s=await navigator.mediaDevices.getDisplayMedia({video:true});R.screen=s.getVideoTracks()[0]}catch(e){return}
-  R.screen.onended=stopShare;setOut('video',R.screen);refresh();
+  try{R.screen=(await navigator.mediaDevices.getDisplayMedia({video:true})).getVideoTracks()[0]}catch(e){return}
+  R.screen.onended=stopShare;setOut('screen',R.screen);refresh();
 }
-function stopShare(){if(!R||!R.screen)return;R.screen.stop();R.screen=null;setOut('video',R.cam);refresh()}
-function tile(id,name){
+function stopShare(){if(!R||!R.screen)return;R.screen.stop();R.screen=null;setOut('screen',null);refresh()}
+function tile(id){
   let t=$$('#lvTiles .lv-tile').find(x=>x.dataset.id===id);
-  if(!t){t=document.createElement('button');t.type='button';t.className='lv-tile';t.dataset.id=id;
-    t.innerHTML='<video autoplay playsinline></video><span></span>';t.lastChild.textContent=name;$('#lvTiles').appendChild(t);
-    const v=t.firstChild;if(R.sink&&v.setSinkId)v.setSinkId(R.sink).catch(()=>{})}
+  if(!t){
+    t=document.createElement('div');t.className='lv-tile';t.dataset.id=id;t.tabIndex=0;
+    t.innerHTML='<video autoplay playsinline></video><em class="lv-ini"></em><span></span><u class="lv-mb" hidden>Mic off</u><button type="button" class="lv-mic" hidden>Mute</button>';
+    $('#lvTiles').appendChild(t);
+    const v=t.firstChild;if(R.sink&&v.setSinkId)v.setSinkId(R.sink).catch(()=>{});
+  }
   return t;
 }
 function bind(v,s){if(v.srcObject!==s)v.srcObject=s}
+/* what fills the big screen: a shared screen first (teacher's first), then a clicked person, then the teacher */
+function mainSrc(){
+  const tid=R.host?'me':R.c.byId,sh=[];
+  const add=id=>{if(id==='me'){if(R.screen)sh.push(['me',R.selfScr])}else{const p=R.peers[id];if(p&&p.st.screen)sh.push([id,p.ss])}};
+  add(tid);Object.keys(R.peers).forEach(add);add('me');
+  if(sh.length)return{id:sh[0][0],s:sh[0][1],scr:true};
+  const id=R.spot&&(R.spot==='me'||R.peers[R.spot])?R.spot:tid;
+  return{id,s:id==='me'?R.selfS:(R.peers[id]?R.peers[id].cs:null)};
+}
 function refresh(){
   if(!R)return;
-  R.selfS.getTracks().forEach(t=>R.selfS.removeTrack(t));if(R.cur.video)R.selfS.addTrack(R.cur.video);
-  const me=tile('me','You');me.hidden=!R.host&&!R.cur.video;me.firstChild.muted=true;bind(me.firstChild,R.selfS);
-  me.classList.toggle('on',R.host&&!R.spot);
-  Object.entries(R.peers).forEach(([id,p])=>{const t=tile(id,p.name);bind(t.firstChild,p.rs);t.classList.toggle('on',R.spot===id)});
-  let s=null;
-  if(R.host)s=R.spot&&R.peers[R.spot]?R.peers[R.spot].rs:R.selfS;else if(R.peers[R.c.byId])s=R.peers[R.c.byId].rs;
-  const v=$('#lvMain');v.muted=R.host;bind(v,s);
-  $('#lvEmpty').hidden=!!(s&&s.getVideoTracks().length&&(R.host?R.cur.video||R.spot:true));
-  const n=Object.keys(R.peers).length,conn=Object.values(R.peers).some(p=>p.pc.connectionState==='connected');
-  $('#lvInfo').textContent=R.host?`${n} student${n===1?'':'s'} connected`:(conn?'Connected':'Connecting…');
+  const sync=(ms,t)=>{ms.getTracks().forEach(x=>x!==t&&ms.removeTrack(x));if(t&&!ms.getTracks().includes(t))ms.addTrack(t)};
+  sync(R.selfS,R.cam);sync(R.selfScr,R.screen);
+  const M=mainSrc();
+  [['me',{name:R.me.name,role:R.me.role,st:st(),cs:R.selfS}],...Object.entries(R.peers)].forEach(([id,o])=>{
+    const t=tile(id),v=t.firstChild,mic=o.st.mic!==false;
+    v.muted=id==='me';bind(v,o.cs);
+    t.hidden=!M.scr&&M.id===id;
+    t.classList.toggle('off',o.st.cam===false);t.classList.toggle('on',R.spot===id);
+    t.querySelector('em').textContent=(o.name||'?').trim().charAt(0).toUpperCase();
+    t.querySelector('span').textContent=(id==='me'?'You':o.name)+(isTeacherRole(o.role)?' (teacher)':'');
+    t.querySelector('u').hidden=mic;
+    t.querySelector('button').hidden=!(R.host&&id!=='me'&&mic);
+  });
+  const v=$('#lvMain');v.muted=true;bind(v,M.s);
+  const camOff=!M.scr&&(M.id==='me'?!R.cam:(R.peers[M.id]?R.peers[M.id].st.cam===false:true));
+  const e=$('#lvEmpty');e.hidden=!!(M.s&&(M.scr||!camOff));
+  e.textContent=M.s?(M.id==='me'?'Your camera is off':'Camera is off'):(R.host?'Waiting for students…':'Connecting to your teacher…');
+  const n=Object.keys(R.peers).length+1,tp=R.peers[R.c.byId];
+  $('#lvInfo').textContent=R.host?`${n} in class`:(tp&&tp.pc.connectionState==='connected'?`Connected · ${n} in class`:'Connecting to your teacher…');
   const set=(id,on,txt)=>{const b=$(id);b.setAttribute('aria-pressed',!!on);b.querySelector('span').textContent=txt};
   set('#lvMic',R.mic,R.mic?'Mic on':'Mic off');set('#lvCam',R.cam,R.cam?'Camera on':'Camera off');
   set('#lvShare',R.screen,R.screen?'Stop sharing':'Share screen');
 }
-$('#lvTiles').onclick=e=>{const t=e.target.closest('.lv-tile');if(!t||!R||!R.host)return;R.spot=(t.dataset.id==='me'||R.spot===t.dataset.id)?null:t.dataset.id;refresh()};
+$('#lvTiles').onclick=e=>{
+  const t=e.target.closest('.lv-tile');if(!t||!R)return;
+  if(e.target.closest('.lv-mic')){if(R.host)sig(t.dataset.id,'mute');return}
+  R.spot=R.spot===t.dataset.id?null:t.dataset.id;refresh();
+};
+$('#lvMuteAll').onclick=()=>{if(R&&R.host){Object.entries(R.peers).forEach(([id,p])=>!isTeacherRole(p.role)&&sig(id,'mute'));toast('Muted all students')}};
 $('#lvMic').onclick=()=>toggle('audio');$('#lvCam').onclick=()=>toggle('video');$('#lvShare').onclick=share;
 $('#lvEnd').onclick=async()=>{
   if(!R)return;const c=R.c;
   if(R.host){
     if(!confirm('End this class for everyone?'))return;
-    leave(true);const{_id,...rest}=LIVE.find(x=>x._id===c._id)||c;
+    leave(true,true);const{_id,...rest}=LIVE.find(x=>x._id===c._id)||c;
     await cmsUpdateItem('liveClasses',c._id,{...rest,status:'ended'});
   }else leave(true);
 };
-function leave(notify){
+function leave(notify,end){
   if(!R)return;const r=R;
-  if(notify)Object.keys(r.peers).forEach(id=>sig(id,'bye'));
-  Object.keys(r.peers).forEach(id=>dropPeer(id,true));
+  if(notify)Object.keys(r.peers).forEach(id=>sig(id,'bye',end?{end:true}:null));
+  Object.keys(r.peers).forEach(id=>dropPeer(id,'silent'));
   [r.mic,r.cam,r.screen].forEach(t=>t&&t.stop());
-  r.bus.close();R=null;
+  if(r.bus)r.bus.close();
+  R=null;
   $('#liveRoom').hidden=true;$('#lvDevs').hidden=true;document.body.style.overflow='';
   $('#lvTiles').innerHTML='';$('#lvMain').srcObject=null;
 }
@@ -2270,7 +2334,7 @@ $('#lvDevBtn').onclick=async()=>{
 };
 async function swap(kind,id){
   R.dev[kind]=id;const k=kind==='audio'?'mic':'cam';
-  if(R[k]){R[k].stop();R[k]=await getTrack(kind);if(kind==='audio'||!R.screen)setOut(kind,R[k]);refresh()}
+  if(R[k]){R[k].stop();R[k]=await getTrack(kind);setOut(kind,R[k]);refresh()}
 }
 $('#lvSelMic').onchange=e=>swap('audio',e.target.value);
 $('#lvSelCam').onchange=e=>swap('video',e.target.value);
@@ -2308,7 +2372,7 @@ $('#lvDl').onclick=()=>{
   a.href=URL.createObjectURL(new Blob([$('#lvMine').value],{type:'text/plain'}));
   a.download=(R.c.t||'class').replace(/[^\w]+/g,'-')+'-notes.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 };
-addEventListener('pagehide',()=>{if(R)leave(!R.host)});
+addEventListener('pagehide',()=>{if(R)leave(true)});
 renderLive();
 
 routeFromHash();
